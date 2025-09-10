@@ -1,5 +1,5 @@
 {
-  "name": "ml-promos-bot",
+  "name": "OfertAi",
   "version": "1.0.0",
   "description": "Bot Telegram que divulga promos do Mercado Livre (sem afiliado)",
   "main": "index.js",
