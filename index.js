@@ -3,11 +3,15 @@ import axios from 'axios';
 import TelegramBot from 'node-telegram-bot-api';
 import cron from 'node-cron';
 
+/**
+ * Config
+ */
 const {
   TELEGRAM_TOKEN,
   SEARCH_TERMS = 'smartphone,notebook',
   CRON_SCHEDULE = '*/120 * * * *',
-  BROADCAST_CHAT_ID // ex.: @meucanal
+  BROADCAST_CHAT_ID,                 // ex.: @meu_canal_publico
+  USE_HEALTH_SERVER                  // se TRUE, assegure que chamou server.js no start
 } = process.env;
 
 if (!TELEGRAM_TOKEN) {
@@ -15,34 +19,72 @@ if (!TELEGRAM_TOKEN) {
   process.exit(1);
 }
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-
-// “Banco” simples em memória (troque por Redis/Postgres depois)
-const subscribers = new Set();
-const sentCache = new Set(); // para evitar repetir o mesmo item seguidamente
-
-async function fetchDealsForTerm(term) {
-  // busca rápida (ajuste 'limit' e 'sort' como quiser)
-  const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(term)}&limit=5&sort=sold_quantity_desc`;
-  const { data } = await axios.get(url, { timeout: 15000 });
-  if (!data?.results) return [];
-  return data.results.map(item => ({
-    id: item.id,
-    title: item.title,
-    price: item.price,
-    original_price: item.original_price,
-    currency: item.currency_id,
-    permalink: item.permalink,
-    thumbnail: item.thumbnail // pode vir com resolução baixa; dá pro gasto
-  }));
+// Se quiser forçar o “health server” no mesmo processo (não é necessário para Background Worker)
+// Dica: prefira rodar "node server.js && node index.js" no script start:web do package.json
+if (USE_HEALTH_SERVER) {
+  try {
+    await import('./server.js');
+  } catch (e) {
+    console.warn('Falha ao iniciar health server (server.js):', e.message);
+  }
 }
 
-function buildCaption(deal) {
-  const price = deal.price?.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-  const old = deal.original_price
+// Inicializa bot (long polling)
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+// “Banco” simples em memória (troque por Redis/Postgres em produção)
+const subscribers = new Set();
+// Evita repetir o mesmo item frequentemente por chat
+const sentCache = new Set(); // chave: `${chatId}:${itemId}`
+
+/**
+ * Busca ofertas no Mercado Livre por termo
+ * Docs públicas: GET https://api.mercadolibre.com/sites/MLB/search?q=...
+ */
+async function fetchDealsForTerm(term) {
+  const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(term)}&limit=5&sort=sold_quantity_desc`;
+  try {
+    const { data } = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'OfertAiBot/1.0 (+https://t.me/OfertAiBot)',
+        'Accept': 'application/json'
+      }
+    });
+    if (!data?.results) return [];
+    return data.results.map(item => ({
+      id: item.id,
+      title: item.title,
+      price: item.price,
+      original_price: item.original_price,
+      currency: item.currency_id,
+      permalink: item.permalink,
+      // Algumas thumbnails vêm com resolução baixa, mas funcionam no Telegram
+      thumbnail: item.thumbnail || item.thumbnail_id || null
+    }));
+  } catch (err) {
+    const status = err?.response?.status;
+    const body = err?.response?.data;
+    console.error('ML request error:', status, body || err.message);
+    throw err;
+  }
+}
+
+/**
+ * Formata o texto (caption) da oferta
+ */
+function formatCaption(deal) {
+  const price = deal.price != null
+    ? deal.price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+    : '—';
+
+  const old = deal.original_price != null
     ? deal.original_price.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
     : null;
-  const off = deal.original_price ? Math.round((1 - deal.price / deal.original_price) * 100) : null;
+
+  const off = (deal.original_price && deal.price)
+    ? Math.round((1 - deal.price / deal.original_price) * 100)
+    : null;
 
   const lines = [];
   lines.push('🔥 <b>Oferta Mercado Livre</b>');
@@ -52,8 +94,11 @@ function buildCaption(deal) {
   return lines.join('\n');
 }
 
+/**
+ * Envia uma oferta para um chat
+ */
 async function sendDeal(chatId, deal) {
-  const caption = buildCaption(deal);
+  const caption = formatCaption(deal);
   const markup = {
     parse_mode: 'HTML',
     reply_markup: {
@@ -61,23 +106,31 @@ async function sendDeal(chatId, deal) {
     }
   };
 
-  // tenta mandar com imagem; se falhar, manda só texto
+  // Tenta enviar com imagem; se falhar, envia apenas texto
   try {
-    await bot.sendPhoto(chatId, deal.thumbnail, { caption, ...markup });
+    if (deal.thumbnail) {
+      await bot.sendPhoto(chatId, deal.thumbnail, { caption, ...markup });
+    } else {
+      throw new Error('Sem thumbnail');
+    }
   } catch {
     await bot.sendMessage(chatId, `${caption}\n\n🔗 ${deal.permalink}`, { parse_mode: 'HTML' });
   }
 }
 
+/**
+ * Envia um lote de ofertas para um chat
+ */
 async function sendDealsToChat(chatId) {
   const terms = SEARCH_TERMS.split(',').map(t => t.trim()).filter(Boolean);
+
   for (const term of terms) {
     try {
       const deals = await fetchDealsForTerm(term);
+
       for (const d of deals) {
-        // Evita spam do mesmo item em sequência
         const key = `${chatId}:${d.id}`;
-        if (sentCache.has(key)) continue;
+        if (sentCache.has(key)) continue; // evita spam do mesmo item
         await sendDeal(chatId, d);
         sentCache.add(key);
       }
@@ -85,19 +138,22 @@ async function sendDealsToChat(chatId) {
       console.error('Erro ao buscar/enviar ofertas:', e.message);
     }
   }
-  // Limpeza simples do cache (mantém leve em execuções longas)
-  if (sentCache.size > 2000) {
-    for (const v of Array.from(sentCache).slice(0, 1000)) sentCache.delete(v);
+
+  // Limpeza simples do cache para não crescer sem limites
+  if (sentCache.size > 5000) {
+    for (const v of Array.from(sentCache).slice(0, 2500)) sentCache.delete(v);
   }
 }
 
-/** Comandos **/
+/**
+ * Comandos do bot
+ */
 bot.onText(/^\/start$/, async (msg) => {
   const chatId = msg.chat.id;
   subscribers.add(chatId);
   await bot.sendMessage(
     chatId,
-    'Bem-vindo! ✅ Você receberá promoções automáticas do Mercado Livre (sem links de afiliado).\n\nUse /stop para parar.\nUse /ofertas para ver agora.'
+    'Bem-vindo! ✅ Você receberá promoções automáticas do Mercado Livre.\n\nComandos:\n/stop – parar de receber\n/ofertas – ver ofertas agora'
   );
   await sendDealsToChat(chatId);
 });
@@ -114,15 +170,19 @@ bot.onText(/^\/ofertas?$/i, async (msg) => {
   await sendDealsToChat(chatId);
 });
 
-/** Cron: envia para inscritos e, opcionalmente, num canal */
-cron.schedule(CRON_SCHEDULE, async () => {
-  console.log('Disparo automático:', new Date().toISOString());
-  for (const chatId of subscribers) {
-    await sendDealsToChat(chatId);
-  }
-  if (BROADCAST_CHAT_ID) {
-    await sendDealsToChat(BROADCAST_CHAT_ID);
-  }
-});
+/**
+ * Cron: envio automático para inscritos e, opcionalmente, para um canal
+ */
+if (CRON_SCHEDULE) {
+  cron.schedule(CRON_SCHEDULE, async () => {
+    console.log('Disparo automático:', new Date().toISOString());
+    for (const chatId of subscribers) {
+      await sendDealsToChat(chatId);
+    }
+    if (BROADCAST_CHAT_ID) {
+      await sendDealsToChat(BROADCAST_CHAT_ID);
+    }
+  });
+}
 
 console.log('Bot rodando. Aguardando /start…');
