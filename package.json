@@ -1,0 +1,14 @@
+{
+  "name": "ml-promos-bot",
+  "version": "1.0.0",
+  "description": "Bot Telegram que divulga promos do Mercado Livre (sem afiliado)",
+  "main": "index.js",
+  "type": "module",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
